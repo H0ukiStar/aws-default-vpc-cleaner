@@ -9,14 +9,14 @@ echo "======================================="
 echo ""
 
 # Check if virtual environment exists
-if [ ! -d "venv" ]; then
+if [ ! -d "build-venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv venv
+    python3 -m venv build-venv
 fi
 
 # Activate virtual environment
 echo "Activating virtual environment..."
-source venv/bin/activate
+source build-venv/bin/activate
 
 # Install/upgrade dependencies
 echo "Installing dependencies..."
@@ -47,6 +47,12 @@ chmod +x dist/aws-default-vpc-cleaner
 echo ""
 echo "Testing build..."
 ./dist/aws-default-vpc-cleaner --version
+
+# Deactivate and clean up virtual environment
+echo ""
+echo "Cleaning up virtual environment..."
+deactivate
+rm -rf build-venv
 
 echo ""
 echo "Build complete!"

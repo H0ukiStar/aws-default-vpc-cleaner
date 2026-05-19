@@ -30,7 +30,7 @@ Pythonがインストールされていないシステムで実行できるス�
 
 ```powershell
 # Activate virtual environment / 仮想環境をアクティベート
-.\venv\Scripts\Activate.ps1
+.\build-venv\Scripts\Activate.ps1
 
 # Install dependencies / 依存関係をインストール
 pip install -r requirements.txt
@@ -81,10 +81,10 @@ sudo dnf install gcc python3-devel -y
 
 ```bash
 # Create virtual environment / 仮想環境を作成
-python3 -m venv venv
+python3 -m venv build-venv
 
 # Activate virtual environment / 仮想環境をアクティベート
-source venv/bin/activate
+source build-venv/bin/activate
 
 # Install dependencies / 依存関係をインストール
 pip install -r requirements.txt

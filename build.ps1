@@ -6,21 +6,19 @@ Write-Host "=======================================" -ForegroundColor Cyan
 Write-Host ""
 
 # Check if virtual environment exists
-if (-not (Test-Path "src\Scripts\python.exe")) {
-    Write-Host "Error: Virtual environment not found in 'src' directory" -ForegroundColor Red
-    Write-Host "Please activate the virtual environment first:" -ForegroundColor Yellow
-    Write-Host "  .\src\Scripts\Activate.ps1" -ForegroundColor Yellow
-    exit 1
+if (-not (Test-Path "build-venv\Scripts\python.exe")) {
+    Write-Host "Creating virtual environment..." -ForegroundColor Yellow
+    python -m venv build-venv
 }
 
 # Activate virtual environment
 Write-Host "Activating virtual environment..." -ForegroundColor Yellow
-& .\src\Scripts\Activate.ps1
+& .\build-venv\Scripts\Activate.ps1
 
 # Install/upgrade dependencies
 Write-Host "Installing dependencies..." -ForegroundColor Yellow
-pip install --upgrade pip
-pip install -e .
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 pip install pyinstaller
 
 # Clean previous builds
@@ -43,6 +41,12 @@ pyinstaller --onefile `
 Write-Host ""
 Write-Host "Testing build..." -ForegroundColor Yellow
 & .\dist\aws-default-vpc-cleaner.exe --version
+
+# Deactivate and clean up virtual environment
+Write-Host ""
+Write-Host "Cleaning up virtual environment..." -ForegroundColor Yellow
+deactivate
+Remove-Item -Recurse -Force build-venv -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "Build complete!" -ForegroundColor Green
