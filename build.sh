@@ -11,7 +11,25 @@ echo ""
 # Check if virtual environment exists
 if [ ! -d "build-venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv build-venv
+
+    # Try to find Python 3.10-3.14 (to avoid overwriting system python3 which is 3.9 on Amazon Linux 2023)
+    PYTHON_CMD=""
+    for version in 3.14 3.13 3.12 3.11 3.10; do
+        if command -v python${version} &> /dev/null; then
+            PYTHON_CMD="python${version}"
+            echo "Found $PYTHON_CMD"
+            break
+        fi
+    done
+
+    if [ -z "$PYTHON_CMD" ]; then
+        echo "Error: Python 3.10 or higher not found."
+        echo "Please install Python 3.10-3.14 (python3.10 to python3.14 command)"
+        echo "Amazon Linux 2023: sudo dnf install python3.14"
+        exit 1
+    fi
+
+    $PYTHON_CMD -m venv build-venv
 fi
 
 # Activate virtual environment
