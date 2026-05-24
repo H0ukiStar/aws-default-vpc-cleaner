@@ -37,9 +37,9 @@ The tool deletes the following resources in order:
 
 **Note for AWS SSO Users / AWS SSO ユーザーへの注意:**
 
-If you use AWS SSO (Single Sign-On) with `aws sso login` or `aws login`, the `awscrt` package is automatically included in the requirements.
+If you use AWS SSO (Single Sign-On) with `aws login`, the `awscrt` package is automatically included in the requirements.
 
-AWS SSO（シングルサインオン）を `aws sso login` または `aws login` で使用する場合、`awscrt` パッケージは requirements に自動的に含まれています。
+AWS SSO（シングルサインオン）を `aws login` で使用する場合、`awscrt` パッケージは requirements に自動的に含まれています。
 
 ### Required IAM Permissions / 必要なIAM権限
 
@@ -107,29 +107,20 @@ This tool requires valid AWS credentials. Configure them using one of the follow
 
 このツールには有効なAWS認証情報が必要です。以下のいずれかの方法で設定してください:
 
-#### Option 1: AWS CLI Configuration / オプション1: AWS CLI設定
+#### Option 1: AWS Login (Console Credentials) / オプション2: AWS Login（コンソール認証情報）
+
+```bash
+# Login using AWS Management Console credentials
+# Requires AWS CLI v2.32.0 or later
+aws login
+```
+
+#### Option 2: AWS CLI Configuration / オプション1: AWS CLI設定
 
 ```bash
 # Configure AWS credentials
 aws configure
 ```
-
-#### Option 2: AWS SSO (Single Sign-On) / オプション2: AWS SSO（シングルサインオン）
-
-```bash
-# Configure AWS SSO profile
-aws configure sso
-
-# Login before using the tool
-aws sso login --profile your-profile-name
-
-# Set the profile as default or use AWS_PROFILE environment variable
-export AWS_PROFILE=your-profile-name
-```
-
-**Note:** When using AWS SSO with `aws sso login` or `aws login`, the `awscrt` package is automatically installed with the requirements.
-
-**注意:** AWS SSOを `aws sso login` または `aws login` で使用する場合、`awscrt`パッケージがrequirementsで自動的にインストールされます。
 
 #### Option 3: Environment Variables / オプション3: 環境変数
 
@@ -296,8 +287,10 @@ mypy src/
 ### Building Executable / 実行可能ファイルのビルド
 
 See [BUILD.md](BUILD.md) for detailed instructions on building standalone executables.
+Dedicated build scripts are available for Windows (`build.ps1`) and Amazon Linux 2023 (`build.sh`).
 
 スタンドアロン実行可能ファイルのビルド手順の詳細は[BUILD.md](BUILD.md)を参照してください。
+Windows用（`build.ps1`）とAmazon Linux 2023用（`build.sh`）の専用ビルドスクリプトを用意しています。
 
 ## Project Structure / プロジェクト構造
 
@@ -340,18 +333,6 @@ aws configure
 Make sure your IAM user/role has the required permissions listed in the [Required IAM Permissions](#required-iam-permissions--必要なiam権限) section.
 
 [必要なIAM権限](#required-iam-permissions--必要なiam権限)セクションに記載されている権限がIAMユーザー/ロールに付与されていることを確認してください。
-
-### Resource Still in Use / リソースがまだ使用中
-
-Some resources may take time to be fully released. Wait a few minutes and try again.
-
-一部のリソースは完全に解放されるまでに時間がかかる場合があります。数分待ってから再試行してください。
-
-## Contributing / コントリビューション
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-コントリビューションを歓迎します！プルリクエストを自由に送信してください。
 
 ## License / ライセンス
 
