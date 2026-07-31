@@ -1,5 +1,5 @@
-"""
-Default VPC Cleaner module.
+"""Default VPC Cleaner module.
+
 デフォルトVPCクリーナーモジュール。
 
 This module provides the main logic for deleting default VPCs
@@ -7,6 +7,7 @@ and related resources.
 デフォルトVPCと関連リソースを削除するメインロジックを提供します。
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,7 @@ from mypy_boto3_ec2.type_defs import (
 
 from src.aws_client import AWSClient, AWSClientFactory
 from src.constants import (
+    MAX_WORKERS,
     RESOURCE_TYPE_IGW,
     RESOURCE_TYPE_NETWORK_ACL,
     RESOURCE_TYPE_ROUTE_TABLE,
@@ -34,8 +36,8 @@ from src.i18n import I18n
 
 @dataclass
 class VPCResource:
-    """
-    Represents a VPC resource to be deleted.
+    """Represents a VPC resource to be deleted.
+
     削除対象のVPCリソースを表します。
 
     Attributes
@@ -55,6 +57,7 @@ class VPCResource:
     metadata : dict[str, Any]
         Additional resource metadata.
         追加のリソースメタデータ。
+
     """
 
     resource_type: str
@@ -66,8 +69,8 @@ class VPCResource:
 
 @dataclass
 class DeletionResult:
-    """
-    Result of deletion operation.
+    """Result of deletion operation.
+
     削除操作の結果。
 
     Attributes
@@ -84,6 +87,7 @@ class DeletionResult:
     errors : list[str]
         List of error messages.
         エラーメッセージのリスト。
+
     """
 
     regions_processed: int = 0
@@ -93,8 +97,8 @@ class DeletionResult:
 
 
 class DefaultVPCCleaner:
-    """
-    Main class for deleting default VPCs and related resources.
+    """Main class for deleting default VPCs and related resources.
+
     デフォルトVPCと関連リソースを削除するメインクラス。
 
     This class orchestrates the deletion of default VPCs across AWS regions.
@@ -118,6 +122,7 @@ class DefaultVPCCleaner:
     >>> i18n = I18n('en')
     >>> cleaner = DefaultVPCCleaner(factory, i18n, verbose=True)
     >>> result = cleaner.run(['us-east-1'], dry_run=False, skip_confirm=False)
+
     """
 
     def __init__(
@@ -126,8 +131,8 @@ class DefaultVPCCleaner:
         i18n: I18n,
         verbose: bool = False,
     ) -> None:
-        """
-        Initialize DefaultVPCCleaner.
+        """Initialize DefaultVPCCleaner.
+
         DefaultVPCCleanerを初期化します。
 
         Parameters
@@ -141,14 +146,15 @@ class DefaultVPCCleaner:
         verbose : bool, optional
             Enable verbose output.
             詳細出力を有効にする。
+
         """
         self.client_factory: AWSClientFactory = client_factory
         self.i18n: I18n = i18n
         self.verbose: bool = verbose
 
     def _print(self, message: str, force: bool = False) -> None:
-        """
-        Print message if verbose mode is enabled.
+        """Print message if verbose mode is enabled.
+
         詳細モードが有効な場合にメッセージを出力します。
 
         Parameters
@@ -159,14 +165,78 @@ class DefaultVPCCleaner:
         force : bool, optional
             Force print even if verbose is False.
             詳細モードでなくても強制的に出力。
+
         """
         if self.verbose or force:
             print(message)
 
-    def list_default_vpcs(self, regions: list[str]) -> dict[str, str]:
+    def _check_region_for_default_vpc(
+        self,
+        region: str,
+    ) -> tuple[str, str | None, list[tuple[str, bool]]]:
+        """Check a single region for a default VPC (thread-safe).
+
+        単一リージョンのデフォルトVPCを確認します(スレッドセーフ)。
+
+        Parameters
+        ----------
+        region : str
+            AWS region name.
+            AWSリージョン名。
+
+        Returns
+        -------
+        tuple[str, str | None, list[tuple[str, bool]]]
+            Tuple of (region, vpc_id or None, log messages).
+            Each log message is (message, force_flag).
+            (リージョン, VPC IDまたはNone, ログメッセージ)のタプル。
+
         """
-        List default VPCs in specified regions.
-        指定されたリージョンのデフォルトVPCをリストします。
+        messages: list[tuple[str, bool]] = []
+        messages.append(
+            (self.i18n.get("checking_default_vpc", region=region), False),
+        )
+
+        try:
+            client: AWSClient = self.client_factory.create_client(region)
+            vpcs: list[VpcTypeDef] = client.describe_vpcs(
+                filters=[{"Name": "isDefault", "Values": ["true"]}],
+            )
+
+            if vpcs:
+                vpc_id: str = vpcs[0].get("VpcId", "")
+                if not vpc_id:
+                    return (region, None, messages)
+                messages.append(
+                    (
+                        self.i18n.get("default_vpc_found", vpc_id=vpc_id),
+                        True,
+                    ),
+                )
+                return (region, vpc_id, messages)
+
+            messages.append(
+                (self.i18n.get("no_default_vpc", region=region), False),
+            )
+            return (region, None, messages)
+
+        except ClientError as e:
+            messages.append(
+                (
+                    self.i18n.get(
+                        "region_failed",
+                        region=region,
+                        error=str(e),
+                    ),
+                    True,
+                ),
+            )
+            return (region, None, messages)
+
+    def list_default_vpcs(self, regions: list[str]) -> dict[str, str]:
+        """List default VPCs in specified regions using parallel processing.
+
+        並列処理を使用して指定リージョンのデフォルトVPCをリストします。
 
         Parameters
         ----------
@@ -179,46 +249,257 @@ class DefaultVPCCleaner:
         dict[str, str]
             Dictionary mapping region names to default VPC IDs.
             リージョン名からデフォルトVPC IDへのマッピング辞書。
+
         """
         default_vpcs: dict[str, str] = {}
 
-        for region in regions:
-            self._print(self.i18n.get("checking_default_vpc", region=region))
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    self._check_region_for_default_vpc,
+                    region,
+                ): region
+                for region in regions
+            }
 
-            try:
-                client: AWSClient = self.client_factory.create_client(region)
-                vpcs: list[VpcTypeDef] = client.describe_vpcs(
-                    filters=[{"Name": "isDefault", "Values": ["true"]}]
-                )
+            for future in as_completed(futures):
+                region, vpc_id, messages = future.result()
 
-                if vpcs:
-                    vpc_id: str = vpcs[0].get("VpcId", "")
-                    if not vpc_id:
-                        continue
+                # Output buffered messages after thread completion
+                for msg, force in messages:
+                    self._print(msg, force=force)
+
+                if vpc_id:
                     default_vpcs[region] = vpc_id
-                    self._print(
-                        self.i18n.get("default_vpc_found", vpc_id=vpc_id),
-                        force=True,
-                    )
-                else:
-                    self._print(self.i18n.get("no_default_vpc", region=region))
-
-            except ClientError as e:
-                self._print(
-                    self.i18n.get(
-                        "region_failed", region=region, error=str(e)
-                    ),
-                    force=True,
-                )
 
         return default_vpcs
 
-    def list_vpc_resources(
-        self, client: AWSClient, vpc_id: str, region: str
-    ) -> list[VPCResource]:
+    def _list_igws(
+        self,
+        client: AWSClient,
+        vpc_id: str,
+        region: str,
+    ) -> tuple[list[VPCResource], list[tuple[str, bool]]]:
+        """List Internet Gateways in a VPC.
+
+        VPC内のインターネットゲートウェイをリストします。
+
         """
-        List all resources in a VPC.
-        VPC内のすべてのリソースをリストします。
+        resources: list[VPCResource] = []
+        messages: list[tuple[str, bool]] = []
+        try:
+            igws: list[InternetGatewayTypeDef] = client.describe_internet_gateways(
+                vpc_id,
+            )
+            for igw in igws:
+                igw_id: str = igw.get("InternetGatewayId", "")
+                if not igw_id:
+                    continue
+                resources.append(
+                    VPCResource(
+                        resource_type=RESOURCE_TYPE_IGW,
+                        resource_id=igw_id,
+                        vpc_id=vpc_id,
+                        region=region,
+                        metadata={"attachments": igw.get("Attachments", [])},
+                    ),
+                )
+                messages.append(
+                    (
+                        self.i18n.get(
+                            "found_resource",
+                            resource_type=RESOURCE_TYPE_IGW,
+                            resource_id=igw_id,
+                        ),
+                        False,
+                    ),
+                )
+        except ClientError as e:
+            messages.append((f"Error listing IGWs: {e}", False))
+        return resources, messages
+
+    def _list_subnets(
+        self,
+        client: AWSClient,
+        vpc_id: str,
+        region: str,
+    ) -> tuple[list[VPCResource], list[tuple[str, bool]]]:
+        """List Subnets in a VPC.
+
+        VPC内のサブネットをリストします。
+
+        """
+        resources: list[VPCResource] = []
+        messages: list[tuple[str, bool]] = []
+        try:
+            subnets: list[SubnetTypeDef] = client.describe_subnets(vpc_id)
+            for subnet in subnets:
+                subnet_id: str = subnet.get("SubnetId", "")
+                if not subnet_id:
+                    continue
+                resources.append(
+                    VPCResource(
+                        resource_type=RESOURCE_TYPE_SUBNET,
+                        resource_id=subnet_id,
+                        vpc_id=vpc_id,
+                        region=region,
+                    ),
+                )
+                messages.append(
+                    (
+                        self.i18n.get(
+                            "found_resource",
+                            resource_type=RESOURCE_TYPE_SUBNET,
+                            resource_id=subnet_id,
+                        ),
+                        False,
+                    ),
+                )
+        except ClientError as e:
+            messages.append((f"Error listing subnets: {e}", False))
+        return resources, messages
+
+    def _list_route_tables(
+        self,
+        client: AWSClient,
+        vpc_id: str,
+        region: str,
+    ) -> tuple[list[VPCResource], list[tuple[str, bool]]]:
+        """List Route Tables in a VPC (excluding main).
+
+        VPC内のルートテーブルをリストします(メインを除く)。
+
+        """
+        resources: list[VPCResource] = []
+        messages: list[tuple[str, bool]] = []
+        try:
+            route_tables: list[RouteTableTypeDef] = client.describe_route_tables(vpc_id)
+            for rt in route_tables:
+                is_main: bool = any(
+                    assoc.get("Main", False) for assoc in rt.get("Associations", [])
+                )
+                if not is_main:
+                    rt_id: str = rt.get("RouteTableId", "")
+                    if not rt_id:
+                        continue
+                    resources.append(
+                        VPCResource(
+                            resource_type=RESOURCE_TYPE_ROUTE_TABLE,
+                            resource_id=rt_id,
+                            vpc_id=vpc_id,
+                            region=region,
+                        ),
+                    )
+                    messages.append(
+                        (
+                            self.i18n.get(
+                                "found_resource",
+                                resource_type=RESOURCE_TYPE_ROUTE_TABLE,
+                                resource_id=rt_id,
+                            ),
+                            False,
+                        ),
+                    )
+        except ClientError as e:
+            messages.append((f"Error listing route tables: {e}", False))
+        return resources, messages
+
+    def _list_security_groups(
+        self,
+        client: AWSClient,
+        vpc_id: str,
+        region: str,
+    ) -> tuple[list[VPCResource], list[tuple[str, bool]]]:
+        """List Security Groups in a VPC (excluding default).
+
+        VPC内のセキュリティグループをリストします(デフォルトを除く)。
+
+        """
+        resources: list[VPCResource] = []
+        messages: list[tuple[str, bool]] = []
+        try:
+            security_groups: list[SecurityGroupTypeDef] = (
+                client.describe_security_groups(vpc_id)
+            )
+            for sg in security_groups:
+                group_name: str = sg.get("GroupName", "")
+                if group_name != "default":
+                    sg_id: str = sg.get("GroupId", "")
+                    if not sg_id:
+                        continue
+                    resources.append(
+                        VPCResource(
+                            resource_type=RESOURCE_TYPE_SECURITY_GROUP,
+                            resource_id=sg_id,
+                            vpc_id=vpc_id,
+                            region=region,
+                        ),
+                    )
+                    messages.append(
+                        (
+                            self.i18n.get(
+                                "found_resource",
+                                resource_type=RESOURCE_TYPE_SECURITY_GROUP,
+                                resource_id=sg_id,
+                            ),
+                            False,
+                        ),
+                    )
+        except ClientError as e:
+            messages.append((f"Error listing security groups: {e}", False))
+        return resources, messages
+
+    def _list_network_acls(
+        self,
+        client: AWSClient,
+        vpc_id: str,
+        region: str,
+    ) -> tuple[list[VPCResource], list[tuple[str, bool]]]:
+        """List Network ACLs in a VPC (excluding default).
+
+        VPC内のネットワークACLをリストします(デフォルトを除く)。
+
+        """
+        resources: list[VPCResource] = []
+        messages: list[tuple[str, bool]] = []
+        try:
+            network_acls: list[NetworkAclTypeDef] = client.describe_network_acls(vpc_id)
+            for nacl in network_acls:
+                if not nacl.get("IsDefault", False):
+                    nacl_id: str = nacl.get("NetworkAclId", "")
+                    if not nacl_id:
+                        continue
+                    resources.append(
+                        VPCResource(
+                            resource_type=RESOURCE_TYPE_NETWORK_ACL,
+                            resource_id=nacl_id,
+                            vpc_id=vpc_id,
+                            region=region,
+                        ),
+                    )
+                    messages.append(
+                        (
+                            self.i18n.get(
+                                "found_resource",
+                                resource_type=RESOURCE_TYPE_NETWORK_ACL,
+                                resource_id=nacl_id,
+                            ),
+                            False,
+                        ),
+                    )
+        except ClientError as e:
+            messages.append((f"Error listing network ACLs: {e}", False))
+        return resources, messages
+
+    def list_vpc_resources(
+        self,
+        client: AWSClient,
+        vpc_id: str,
+        region: str,
+    ) -> list[VPCResource]:
+        """List all resources in a VPC using parallel processing.
+
+        並列処理を使用してVPC内のすべてのリソースをリストします。
 
         Parameters
         ----------
@@ -237,155 +518,32 @@ class DefaultVPCCleaner:
         list[VPCResource]
             List of VPC resources.
             VPCリソースのリスト。
-        """
-        resources: list[VPCResource] = []
 
+        """
         self._print(self.i18n.get("listing_resources", vpc_id=vpc_id))
 
-        # Internet Gateways
-        try:
-            igws: list[InternetGatewayTypeDef] = (
-                client.describe_internet_gateways(vpc_id)
-            )
-            for igw in igws:
-                igw_id: str = igw.get("InternetGatewayId", "")
-                if not igw_id:
-                    continue
-                resources.append(
-                    VPCResource(
-                        resource_type=RESOURCE_TYPE_IGW,
-                        resource_id=igw_id,
-                        vpc_id=vpc_id,
-                        region=region,
-                        metadata={"attachments": igw.get("Attachments", [])},
-                    )
-                )
-                self._print(
-                    self.i18n.get(
-                        "found_resource",
-                        resource_type=RESOURCE_TYPE_IGW,
-                        resource_id=igw_id,
-                    )
-                )
-        except ClientError as e:
-            self._print(f"Error listing IGWs: {e}")
+        list_functions = [
+            self._list_igws,
+            self._list_subnets,
+            self._list_route_tables,
+            self._list_security_groups,
+            self._list_network_acls,
+        ]
 
-        # Subnets
-        try:
-            subnets: list[SubnetTypeDef] = client.describe_subnets(vpc_id)
-            for subnet in subnets:
-                subnet_id: str = subnet.get("SubnetId", "")
-                if not subnet_id:
-                    continue
-                resources.append(
-                    VPCResource(
-                        resource_type=RESOURCE_TYPE_SUBNET,
-                        resource_id=subnet_id,
-                        vpc_id=vpc_id,
-                        region=region,
-                    )
-                )
-                self._print(
-                    self.i18n.get(
-                        "found_resource",
-                        resource_type=RESOURCE_TYPE_SUBNET,
-                        resource_id=subnet_id,
-                    )
-                )
-        except ClientError as e:
-            self._print(f"Error listing subnets: {e}")
+        all_resources: list[VPCResource] = []
 
-        # Route Tables (excluding main route table)
-        try:
-            route_tables: list[RouteTableTypeDef] = (
-                client.describe_route_tables(vpc_id)
-            )
-            for rt in route_tables:
-                # Skip main route table
-                is_main: bool = any(
-                    assoc.get("Main", False)
-                    for assoc in rt.get("Associations", [])
-                )
-                if not is_main:
-                    rt_id: str = rt.get("RouteTableId", "")
-                    if not rt_id:
-                        continue
-                    resources.append(
-                        VPCResource(
-                            resource_type=RESOURCE_TYPE_ROUTE_TABLE,
-                            resource_id=rt_id,
-                            vpc_id=vpc_id,
-                            region=region,
-                        )
-                    )
-                    self._print(
-                        self.i18n.get(
-                            "found_resource",
-                            resource_type=RESOURCE_TYPE_ROUTE_TABLE,
-                            resource_id=rt_id,
-                        )
-                    )
-        except ClientError as e:
-            self._print(f"Error listing route tables: {e}")
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [
+                executor.submit(fn, client, vpc_id, region) for fn in list_functions
+            ]
 
-        # Security Groups (excluding default security group)
-        try:
-            security_groups: list[SecurityGroupTypeDef] = (
-                client.describe_security_groups(vpc_id)
-            )
-            for sg in security_groups:
-                group_name: str = sg.get("GroupName", "")
-                if group_name != "default":
-                    sg_id: str = sg.get("GroupId", "")
-                    if not sg_id:
-                        continue
-                    resources.append(
-                        VPCResource(
-                            resource_type=RESOURCE_TYPE_SECURITY_GROUP,
-                            resource_id=sg_id,
-                            vpc_id=vpc_id,
-                            region=region,
-                        )
-                    )
-                    self._print(
-                        self.i18n.get(
-                            "found_resource",
-                            resource_type=RESOURCE_TYPE_SECURITY_GROUP,
-                            resource_id=sg_id,
-                        )
-                    )
-        except ClientError as e:
-            self._print(f"Error listing security groups: {e}")
+            for future in futures:
+                resources, messages = future.result()
+                all_resources.extend(resources)
+                for msg, force in messages:
+                    self._print(msg, force=force)
 
-        # Network ACLs (excluding default ACL)
-        try:
-            network_acls: list[NetworkAclTypeDef] = (
-                client.describe_network_acls(vpc_id)
-            )
-            for nacl in network_acls:
-                if not nacl.get("IsDefault", False):
-                    nacl_id: str = nacl.get("NetworkAclId", "")
-                    if not nacl_id:
-                        continue
-                    resources.append(
-                        VPCResource(
-                            resource_type=RESOURCE_TYPE_NETWORK_ACL,
-                            resource_id=nacl_id,
-                            vpc_id=vpc_id,
-                            region=region,
-                        )
-                    )
-                    self._print(
-                        self.i18n.get(
-                            "found_resource",
-                            resource_type=RESOURCE_TYPE_NETWORK_ACL,
-                            resource_id=nacl_id,
-                        )
-                    )
-        except ClientError as e:
-            self._print(f"Error listing network ACLs: {e}")
-
-        return resources
+        return all_resources
 
     def delete_vpc_resources(
         self,
@@ -395,8 +553,8 @@ class DefaultVPCCleaner:
         dry_run: bool,
         errors: list[str],
     ) -> int:
-        """
-        Delete VPC resources in the correct order.
+        """Delete VPC resources in the correct order.
+
         正しい順序でVPCリソースを削除します。
 
         Parameters
@@ -422,6 +580,7 @@ class DefaultVPCCleaner:
         int
             Number of resources deleted.
             削除したリソース数。
+
         """
         deleted_count: int = 0
 
@@ -436,9 +595,7 @@ class DefaultVPCCleaner:
         ]
 
         for resource_type in resource_order:
-            for resource in [
-                r for r in resources if r.resource_type == resource_type
-            ]:
+            for resource in [r for r in resources if r.resource_type == resource_type]:
                 try:
                     if dry_run:
                         self._print(
@@ -471,10 +628,12 @@ class DefaultVPCCleaner:
         return deleted_count
 
     def _delete_resource(
-        self, client: AWSClient, resource: VPCResource
+        self,
+        client: AWSClient,
+        resource: VPCResource,
     ) -> None:
-        """
-        Delete a single resource.
+        """Delete a single resource.
+
         単一のリソースを削除します。
 
         Parameters
@@ -485,24 +644,26 @@ class DefaultVPCCleaner:
         resource : VPCResource
             Resource to delete.
             削除するリソース。
+
         """
         if resource.resource_type == RESOURCE_TYPE_IGW:
             # Detach before deleting
             self._print(
-                self.i18n.get("detaching_igw", igw_id=resource.resource_id)
+                self.i18n.get("detaching_igw", igw_id=resource.resource_id),
             )
             client.detach_internet_gateway(
-                resource.resource_id, resource.vpc_id
+                resource.resource_id,
+                resource.vpc_id,
             )
             self._print(
-                self.i18n.get("igw_detached", igw_id=resource.resource_id)
+                self.i18n.get("igw_detached", igw_id=resource.resource_id),
             )
             self._print(
                 self.i18n.get(
                     "deleting_resource",
                     resource_type=resource.resource_type,
                     resource_id=resource.resource_id,
-                )
+                ),
             )
             client.delete_internet_gateway(resource.resource_id)
 
@@ -512,7 +673,7 @@ class DefaultVPCCleaner:
                     "deleting_resource",
                     resource_type=resource.resource_type,
                     resource_id=resource.resource_id,
-                )
+                ),
             )
             client.delete_subnet(resource.resource_id)
 
@@ -522,7 +683,7 @@ class DefaultVPCCleaner:
                     "deleting_resource",
                     resource_type=resource.resource_type,
                     resource_id=resource.resource_id,
-                )
+                ),
             )
             client.delete_route_table(resource.resource_id)
 
@@ -532,7 +693,7 @@ class DefaultVPCCleaner:
                     "deleting_resource",
                     resource_type=resource.resource_type,
                     resource_id=resource.resource_id,
-                )
+                ),
             )
             client.delete_security_group(resource.resource_id)
 
@@ -542,7 +703,7 @@ class DefaultVPCCleaner:
                     "deleting_resource",
                     resource_type=resource.resource_type,
                     resource_id=resource.resource_id,
-                )
+                ),
             )
             client.delete_network_acl(resource.resource_id)
 
@@ -554,8 +715,8 @@ class DefaultVPCCleaner:
         dry_run: bool,
         errors: list[str],
     ) -> tuple[bool, int]:
-        """
-        Delete a VPC and all its resources.
+        """Delete a VPC and all its resources.
+
         VPCとそのすべてのリソースを削除します。
 
         Parameters
@@ -585,17 +746,24 @@ class DefaultVPCCleaner:
             (success, deleted_count)のタプル。
             successはVPCが削除された場合True、
             deleted_countは削除されたリソース数。
+
         """
         deleted_count: int = 0
         try:
             # List all resources in the VPC
             resources: list[VPCResource] = self.list_vpc_resources(
-                client, vpc_id, region
+                client,
+                vpc_id,
+                region,
             )
 
             # Delete resources
             deleted_count = self.delete_vpc_resources(
-                client, resources, vpc_id, dry_run, errors
+                client,
+                resources,
+                vpc_id,
+                dry_run,
+                errors,
             )
 
             # Delete VPC itself
@@ -610,11 +778,13 @@ class DefaultVPCCleaner:
                 )
             else:
                 self._print(
-                    self.i18n.get("deleting_vpc", vpc_id=vpc_id), force=True
+                    self.i18n.get("deleting_vpc", vpc_id=vpc_id),
+                    force=True,
                 )
                 client.delete_vpc(vpc_id)
                 self._print(
-                    self.i18n.get("vpc_deleted", vpc_id=vpc_id), force=True
+                    self.i18n.get("vpc_deleted", vpc_id=vpc_id),
+                    force=True,
                 )
                 # VPC itself counts as one resource
                 deleted_count += 1
@@ -622,7 +792,7 @@ class DefaultVPCCleaner:
             return True, deleted_count
 
         except ClientError as e:
-            error_msg: str = f"{region}: {str(e)}"
+            error_msg: str = f"{region}: {e!s}"
             self._print(
                 self.i18n.get("region_failed", region=region, error=str(e)),
                 force=True,
@@ -631,10 +801,13 @@ class DefaultVPCCleaner:
             return False, deleted_count
 
     def run(
-        self, regions: list[str] | None, dry_run: bool, skip_confirm: bool
+        self,
+        regions: list[str] | None,
+        dry_run: bool,
+        skip_confirm: bool,
     ) -> DeletionResult:
-        """
-        Run the default VPC cleaner.
+        """Run the default VPC cleaner.
+
         デフォルトVPCクリーナーを実行します。
 
         Parameters
@@ -654,6 +827,7 @@ class DefaultVPCCleaner:
         DeletionResult
             Result of the deletion operation.
             削除操作の結果。
+
         """
         result: DeletionResult = DeletionResult()
 
@@ -694,7 +868,8 @@ class DefaultVPCCleaner:
         # Process each region
         for region, vpc_id in default_vpcs.items():
             self._print(
-                self.i18n.get("processing_region", region=region), force=True
+                self.i18n.get("processing_region", region=region),
+                force=True,
             )
 
             try:
@@ -702,7 +877,11 @@ class DefaultVPCCleaner:
                 success: bool
                 deleted_count: int
                 success, deleted_count = self.delete_vpc(
-                    client, vpc_id, region, dry_run, result.errors
+                    client,
+                    vpc_id,
+                    region,
+                    dry_run,
+                    result.errors,
                 )
 
                 result.regions_processed += 1
@@ -716,11 +895,13 @@ class DefaultVPCCleaner:
                 )
 
             except Exception as e:
-                error_msg: str = f"{region}: {str(e)}"
+                error_msg: str = f"{region}: {e!s}"
                 result.errors.append(error_msg)
                 self._print(
                     self.i18n.get(
-                        "region_failed", region=region, error=str(e)
+                        "region_failed",
+                        region=region,
+                        error=str(e),
                     ),
                     force=True,
                 )

@@ -1,5 +1,5 @@
-"""
-Constants module.
+"""Constants module.
+
 定数モジュール。
 
 This module defines constants used throughout the application.
@@ -28,3 +28,6 @@ SUPPORTED_LANGUAGES: Final[list[str]] = ["en", "ja"]
 # AWS API retry configuration / AWS API リトライ設定
 # boto3's Config retries parameter
 MAX_RETRIES: Final[int] = 3
+
+# Parallel processing / 並列処理設定
+MAX_WORKERS: Final[int] = 10
